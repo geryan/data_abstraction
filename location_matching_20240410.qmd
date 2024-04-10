@@ -1,0 +1,258 @@
+---
+title: "location_matching_20240409"
+#format: html
+#format: pdf
+format: md
+editor: visual
+---
+
+Working with files from: `googledrive/VECTOR ATLAS/2024-03-14 - VA old but updata data for cleaning`
+
+![](google_drive.png)
+
+Matching locations missing in: `final_species.csv`,
+
+from: `OLD MAP database dump/20210726_vector_extraction (1).csv`
+
+Packages
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(countrycode)
+```
+
+Read in data files and look at them:
+
+##### new data base
+
+```{r}
+new_db <- read_csv(
+  file = "2024-03-14 - VA old but updated data for cleaning/final_species.csv",
+  guess_max = 30000
+)
+
+glimpse(new_db)
+```
+
+#### old data dump
+
+read in, and get rid of non-African sites
+
+```{r}
+
+old_db <- read_csv(
+  file = "2024-03-14 - VA old but updated data for cleaning/OLD MAP database dump/20210726_vector_extraction (1).csv"
+) |>
+  mutate( # assign a continent based on the 3-letter country ID
+    # some vector_site_country entries are blank, but the ID is not
+    continent = countrycode(
+      vector_site_country_id,
+      "iso3c",
+      "continent"
+    )
+  ) |>
+  filter(continent == "Africa") |> # only keep African countries
+  select(-continent) # remove this column from the database
+  
+
+glimpse(old_db)
+```
+
+Get site data from old database. This is unique combinations of site id, site name, latitude, and longitude
+
+```{r}
+old_sites <- old_db |>
+  select(
+    #id = vector_site_id,
+    site = vector_site_full_name,
+    lat = vector_site_coordinates_latitude,
+    lon = vector_site_coordinates_longitude
+  ) |>
+  distinct()
+
+old_sites
+```
+
+There are 2444 unique combinations. However, some site names correspond to \>1 set of coordinates or vice versa, as there are fewer unique site names than site IDs, and no site names are missing:
+
+```{r}
+length(unique(old_sites$site)) # number of unique site names
+sum(is.na(old_sites$site)) # number of missing site names
+```
+
+Let's find the duplicated names, and check for duplicated coordinates. Here are all the sites with either duplicated names or duplicated coordinates
+
+```{r}
+old_dup <- old_sites |>
+  group_by(site) |>
+  mutate(
+    unique_site = n(),
+    unique_site = ifelse(unique_site == 1, TRUE, FALSE)
+  ) |>
+  ungroup () |>
+  group_by(lon, lat) |>
+  mutate(
+    unique_coords = n(),
+    unique_coords = ifelse(unique_coords == 1, TRUE, FALSE)
+  ) |>
+  filter(!unique_site | !unique_coords) |>
+  arrange(site)
+
+old_dup
+```
+
+There are 1070 entries where the site name or coordinates or both are duplicated.
+
+We have four possible groups based on whether site and/or coordinates are unique:
+
+| Unique site | Unique coordinates | Implication |
+|-----|-----|---------------|
+| TRUE        | TRUE               | Data are good to go |
+| FALSE       | TRUE               | Multiple locations with single name. This is a problem ; not matchable as is. Coods may have a typo. |
+| TRUE        | FALSE              | Same location with multiple names. Possible name typos. This is not a problem and should be matchable if typo is carried over.  |
+| FALSE       | FALSE              | Multiple names for same location AND multiple locations for same name  |
+
+
+#### Duplicated site; unique coordinates:
+```{r}
+old_dup |>
+  filter(
+    !unique_site & unique_coords
+  )
+```
+
+So 665 entries have site names associated with \>1 sets of coordinates. Some look like typos in the coordinates (e.g., Abia), others look like different nearby locations given the same name (Abuja)
+
+```{r}
+old_dup |>
+  filter(
+    !unique_site & unique_coords
+  ) |>
+  pull(site) |>
+  unique() |>
+  length()
+```
+
+Of which there are 326 unique site names.
+
+#### Unique site; duplicated coordinates
+```{r}
+old_dup |>
+  filter(
+    unique_site & !unique_coords
+  ) |>
+  arrange(lat, lon)
+```
+There are 200 of these which look like they include typos in site names. NB: some must include sites where the name is not unique and location not unique 
+
+```{r}
+old_dup |>
+  filter(
+    unique_site & !unique_coords
+  ) |>
+  arrange(lat, lon)  |>
+  pull(site) |>
+  unique() |>
+  length()
+```
+These make 200 unique names, as expected.
+
+#### Duplicated site; duplicated coordinates
+
+Arranged by site name:
+```{r}
+old_dup |>
+  filter(
+    !unique_site & !unique_coords
+  ) |>
+  arrange(site)
+```
+
+And coordinates:
+```{r}
+old_dup |>
+  filter(
+    !unique_site & !unique_coords
+  ) |>
+  arrange(lat, lon)
+```
+There are 77 of these. Some include Multiple spellings of the name multiple times AND slight variations of coordinates, e.g. Asembo / Asembo Bay.
+
+Some entries will match with entries in other categories, i.e. with unique s have spelling variations that are unique OR coordinates that are unique: 
+```{r}
+old_dup |>
+  filter(site %in% c("Ophansi", "Opansi"))
+```
+
+
+## Matching
+
+Sites, sorted by name in the new database:
+```{r}
+new_sites <- new_db |>
+  select(site, lat = latitude_1, lon = longitude_1) |>
+  distinct() |>
+  arrange(site)
+new_sites
+```
+*(NB: in these data it is evident that there are multiple site names for the same location also in this new database, and multiple locations for the same name)*
+
+We can prioritise (well, are only interested in) matching the sites with missing coordinates
+```{r}
+missing_sites <- new_sites |>
+  filter(is.na(lat)) |>
+  select(site)
+
+missing_sites
+```
+
+Try matching to `old_sites` and check how many matches are made.
+```{r}
+site_match <- missing_sites |>
+  left_join(
+    y = old_sites,
+    by = "site"
+  ) |>
+  group_by(site) |>
+  mutate(
+    n = n()
+  ) |>
+  ungroup() |>
+  mutate(
+    nmatches = case_when(
+      is.na(lat) ~ 0,
+      TRUE ~ n
+    )
+  ) |>
+  select(-n)
+
+site_match
+```
+
+Sites with no match:
+```{r}
+site_match |>
+  filter(nmatches == 0)
+```
+**371 sites with no matching site name in the old data base.**
+
+
+Sites with multiple matches:
+```{r}
+site_match |>
+  filter(nmatches > 1) |>
+  print() |>
+  write_csv("multiple_matches_20240409.csv")
+```
+264 entries
+
+```{r}
+site_match |>
+  filter(nmatches > 1) |>
+  pull(site) |>
+  unique() |>
+  length()
+```
+92 unique site names with multiple sets of coordinates attached.
